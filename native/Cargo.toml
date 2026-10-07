@@ -8,10 +8,6 @@ license = "MIT"
 name = "chatgpt-kanban"
 path = "src/main.rs"
 
-[features]
-# Compiled only by the existing isolated contract fixture, never desktop builds.
-test-fixture = []
-
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

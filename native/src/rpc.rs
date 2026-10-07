@@ -25,9 +25,6 @@ pub struct Rpc {
 impl Rpc {
     pub async fn start(binary: &Path, events: SharedEvents, session: &str) -> Result<Arc<Self>> {
         let mut command = command(binary);
-        #[cfg(feature = "test-fixture")]
-        command.arg(std::env::var("CLC_FIXTURE_SCRIPT").map_err(|_| "fixture script missing")?);
-        #[cfg(not(feature = "test-fixture"))]
         command.arg("app-server");
         #[cfg(unix)]
         command.process_group(0);

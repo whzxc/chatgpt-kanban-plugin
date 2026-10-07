@@ -47,6 +47,7 @@ impl Service {
             .map_err(|e| e.to_string())?
             .validate(&args)
             .map_err(|e| e.to_string())?;
+        kernel::origin::ORIGIN.scope(json!({"ingressId":"kanban-plugin","controlSource":"chatgpt-desktop","authType":"local-owner"}), async {
         match name {
             "kanban" => self.kanban.query(self, &args).await,
             "kanban_update" => self.kanban.update(self, &args).await,
@@ -55,5 +56,6 @@ impl Service {
             "agent_tasks" | "agent_read" => self.agents.tool(&self.control, name, args).await,
             _ => Err("UNKNOWN_TOOL".into()),
         }
+        }).await
     }
 }

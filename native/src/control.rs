@@ -203,11 +203,6 @@ impl Control {
         result
     }
     pub async fn request(&self, method: &str, args: Value, timeout: u64) -> Result<Value> {
-        #[cfg(feature = "test-fixture")]
-        {
-            return self.utility().await?.call(method, args, timeout).await;
-        }
-        #[allow(unreachable_code)]
         if self.background(string(&args, "threadId"))? {
             return self.background_request(method, args, timeout).await;
         }
