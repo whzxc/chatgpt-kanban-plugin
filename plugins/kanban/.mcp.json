@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kanban": {
+      "command": "./bin/chatgpt-kanban",
+      "args": [
+        "mcp"
+      ],
+      "cwd": "."
+    }
+  }
+}

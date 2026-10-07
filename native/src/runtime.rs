@@ -1,0 +1,311 @@
+//! One authenticated, leased Kanban runtime process per state directory, shared by all local entrypoints.
+use crate::*;
+use std::{
+    collections::HashMap,
+    fs::File,
+    process::Stdio,
+    time::{Duration, Instant},
+};
+use tokio::sync::{Notify, RwLock, RwLockReadGuard};
+
+const LEASE_TTL: Duration = Duration::from_secs(10);
+struct Lease {
+    pid: u32,
+    kind: String,
+    seen: Instant,
+}
+#[derive(Default)]
+pub struct State {
+    leases: std::sync::Mutex<HashMap<String, Lease>>,
+    pub shutdown: Notify,
+    closing: std::sync::atomic::AtomicBool,
+}
+impl State {
+    fn active(&self) -> std::sync::MutexGuard<'_, HashMap<String, Lease>> {
+        let mut leases = self.leases.lock().unwrap();
+        leases.retain(|_, lease| lease.seen.elapsed() < LEASE_TTL);
+        leases
+    }
+    pub fn clients(&self) -> Value {
+        json!(self
+            .active()
+            .iter()
+            .map(|(id, lease)| json!({"id":id,"pid":lease.pid,"kind":lease.kind}))
+            .collect::<Vec<_>>())
+    }
+    pub fn request(&self, route: &str, body: Value) -> Result<Value> {
+        let key = string(&body, "id");
+        uuid::Uuid::parse_str(key).map_err(|_| "invalid client id")?;
+        let mut leases = self.active();
+        match route {
+            "runtime/lease" => {
+                if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("runtime shutting down".into());
+                }
+                let kind = string(&body, "kind");
+                if kind != "plugin" || !body["pid"].is_u64() {
+                    return Err("invalid local entrypoint".into());
+                }
+                if leases.len() >= 128 && !leases.contains_key(key) {
+                    return Err("too many local clients".into());
+                }
+                leases.insert(
+                    key.into(),
+                    Lease {
+                        pid: body["pid"].as_u64().unwrap() as u32,
+                        kind: kind.into(),
+                        seen: Instant::now(),
+                    },
+                );
+                Ok(json!({"instance":key,"version":env!("CARGO_PKG_VERSION")}))
+            }
+            "runtime/release" => {
+                leases.remove(key);
+                Ok(json!({"released":true}))
+            }
+            "runtime/shutdown" => {
+                if !leases.contains_key(key) || leases.keys().any(|id| id != key) {
+                    return Err(
+                        "其他本地入口仍在使用 Kanban runtime；请先关闭这些插件或 Desktop，再安装更新。"
+                            .into(),
+                    );
+                }
+                self.closing
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.shutdown.notify_one();
+                Ok(json!({"closing":true}))
+            }
+            _ => Err("UNKNOWN_ROUTE".into()),
+        }
+    }
+}
+
+pub fn binary() -> Result<PathBuf> {
+    std::env::current_exe().map_err(|e| e.to_string())
+}
+
+pub fn build_id(binary: &Path) -> Result<String> {
+    Ok(hash(std::fs::read(binary).map_err(|e| e.to_string())?))
+}
+
+async fn owner(build: &str) -> Result<Option<Value>> {
+    let Ok(info) = load(&root().join("web/native.json")) else {
+        return Ok(None);
+    };
+    let Some(port) = info["port"].as_u64().filter(|p| *p > 0 && *p <= 65535) else {
+        return Ok(None);
+    };
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(format!("http://127.0.0.1:{port}/healthz"))
+        .bearer_auth(string(&info, "token"))
+        .timeout(Duration::from_millis(800))
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return Ok(None);
+    };
+    let Ok(health) = response.json::<Value>().await else {
+        return Ok(None);
+    };
+    if health["instance"] != info["instance"] {
+        return Ok(None);
+    }
+    if health["owner"] != "kanban"
+        || health["version"] != env!("CARGO_PKG_VERSION")
+        || health["build"] != build
+    {
+        return Err(
+            "KANBAN_BUILD_MISMATCH：请关闭其他本地入口，再重新加载同一构建的 插件。".into(),
+        );
+    }
+    Ok(Some(info))
+}
+
+pub struct Client {
+    id: String,
+    kind: String,
+    binary: PathBuf,
+    build: String,
+    startup: Mutex<()>,
+    active: RwLock<bool>,
+    heartbeat: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+impl Client {
+    pub async fn connect(binary: PathBuf, kind: &str) -> Result<Arc<Self>> {
+        init_crypto();
+        let client = Arc::new(Self {
+            id: id(),
+            kind: kind.into(),
+            build: build_id(&binary)?,
+            binary,
+            startup: Mutex::new(()),
+            active: RwLock::new(true),
+            heartbeat: Default::default(),
+        });
+        // Only a new entrypoint waits for a previous owner's lease to expire.
+        // Retrying under the request gate would serialize every UI poll for 18
+        // seconds and keep update shutdown waiting behind all queued readers.
+        let deadline = Instant::now() + Duration::from_secs(18);
+        loop {
+            match client.ensure().await {
+                Err(error)
+                    if error.starts_with("KANBAN_BUILD_MISMATCH") && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                result => {
+                    drop(result?);
+                    break;
+                }
+            }
+        }
+        client.resume().await;
+        Ok(client)
+    }
+    pub async fn resume(self: &Arc<Self>) {
+        *self.active.write().await = true;
+        let mut heartbeat = self.heartbeat.lock().unwrap();
+        if heartbeat.is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let Some(client) = weak.upgrade() else {
+                    return;
+                };
+                if let Err(error) = client.ensure().await {
+                    eprintln!("Kanban runtime heartbeat: {error}");
+                };
+            }
+        });
+        *heartbeat = Some(task);
+    }
+    async fn ensure(&self) -> Result<RwLockReadGuard<'_, bool>> {
+        let active = self.active.read().await;
+        if !*active {
+            return Err("Kanban runtime 已暂停，正在关闭或安装更新。".into());
+        }
+        self.ensure_core().await?;
+        Ok(active)
+    }
+    async fn ensure_core(&self) -> Result<()> {
+        let _startup = self.startup.lock().await;
+        let current = owner(&self.build).await?;
+        if current.is_none() {
+            private_dir(&root())?;
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root().join("runtime.log"))
+                .map_err(|e| e.to_string())?;
+            let mut child = std::process::Command::new(&self.binary);
+            child
+                .arg("serve")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(log);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                child.process_group(0);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                child.creation_flags(0x08000200);
+            }
+            let mut child = child
+                .spawn()
+                .map_err(|e| format!("Kanban runtime start failed: {e}"))?;
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while owner(&self.build).await?.is_none() {
+                if Instant::now() >= deadline {
+                    return Err("Kanban runtime 启动超时；请检查状态目录中的 runtime.log。".into());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        crate::transport::forward_request(
+            "runtime/lease",
+            "POST",
+            json!({"id":self.id,"kind":self.kind,"pid":std::process::id()}),
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn request(&self, route: &str, method: &str, body: Value) -> Result<Value> {
+        let _active = self.ensure().await?;
+        crate::transport::forward_request(route, method, body).await
+    }
+    pub async fn close(&self) {
+        let mut active = self.active.write().await;
+        *active = false;
+        if let Some(task) = self.heartbeat.lock().unwrap().take() {
+            task.abort();
+        }
+        let _ = crate::transport::forward_request("runtime/release", "POST", json!({"id":self.id}))
+            .await;
+    }
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(task) = self.heartbeat.lock().unwrap().take() {
+            task.abort();
+        }
+    }
+}
+
+pub async fn serve() -> Result<()> {
+    init_crypto();
+    private_dir(&root())?;
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root().join("runtime.lock"))
+        .map_err(|e| e.to_string())?;
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+    if owner(&build_id(
+        &std::env::current_exe().map_err(|e| e.to_string())?,
+    )?)
+    .await?
+    .is_some()
+    {
+        return Ok(());
+    }
+    let service = crate::service::Service::new()?;
+    let listener = crate::transport::listen(service.clone()).await?;
+    let started = Instant::now();
+    let mut empty_since = None;
+    loop {
+        tokio::select! {
+            _ = service.runtime.shutdown.notified() => break,
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if service.runtime.active().is_empty() {
+                    let empty = empty_since.get_or_insert_with(Instant::now);
+                    if started.elapsed() > Duration::from_secs(15) && empty.elapsed() > Duration::from_secs(2) { break; }
+                } else { empty_since = None; }
+            }
+        }
+    }
+    let result = service.stop().await;
+    listener.abort();
+    let metadata = root().join("web/native.json");
+    if load(&metadata).is_ok_and(|v| v["pid"] == std::process::id()) {
+        let _ = std::fs::remove_file(metadata);
+    }
+    drop(lock);
+    result
+}

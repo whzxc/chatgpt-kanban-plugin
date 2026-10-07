@@ -1,0 +1,23 @@
+{
+  "name": "kanban",
+  "version": "0.1.0",
+  "description": "Kanban boards and linked Agent tasks for ChatGPT Desktop.",
+  "author": {
+    "name": "ChatGPT Kanban Plugin contributors"
+  },
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Kanban",
+    "shortDescription": "Work items and linked Agent tasks.",
+    "longDescription": "Manage cards, checklists, task links and explicit Agent execution in a ChatGPT Desktop board.",
+    "developerName": "ChatGPT Kanban Plugin contributors",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg",
+    "logoDark": "./assets/icon.svg",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ]
+  }
+}
