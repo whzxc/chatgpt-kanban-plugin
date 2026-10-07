@@ -10,7 +10,7 @@ import {
   CircleCheck,
   CircleDashed,
   ExternalLink,
-  KanbanSquare,
+  SquareKanban,
   Maximize2,
   Minimize2,
   Pencil,
@@ -83,6 +83,7 @@ type Board = {
     result?: { error?: { message?: string } };
   };
   executionError?: string;
+  discoveryError?: string;
 };
 const stages: Stage[] = ["todo", "doing", "review", "done"];
 const icons = [CircleDashed, Circle, CheckCheck, CircleCheck];
@@ -365,8 +366,8 @@ export default function Kanban() {
       >
         <header className="kanban-header">
           <div className="kanban-heading">
-            <Icon icon={KanbanSquare} size={20} />
-            <h1>{l("看板", "Kanban")}</h1>
+            <Icon icon={SquareKanban} size={20} />
+            <h1>Kanban</h1>
             <span className="kanban-count">{visible.length}</span>
           </div>
           <div className="kanban-actions">
@@ -463,6 +464,7 @@ export default function Kanban() {
             {error}
           </ErrorCallout>
         )}
+        {board?.discoveryError && <ErrorCallout>{l("本机任务读取失败：", "Could not load local tasks: ")}{board.discoveryError}</ErrorCallout>}
         {!board ? (
           <div className="kanban-loading">
             <LoadingIndicator label={l("加载中", "Loading")} />

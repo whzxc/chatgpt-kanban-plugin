@@ -3,7 +3,7 @@ use crate::*;
 use std::time::Duration;
 
 #[derive(Default)]
-pub struct Kanban(Mutex<()>);
+pub struct Kanban(Mutex<()>, Mutex<Option<(std::time::Instant, Vec<Value>)>>);
 
 fn read() -> Result<Value> {
     let path = root().join("kanban.json");
@@ -18,7 +18,19 @@ fn read() -> Result<Value> {
 }
 fn write(board: &mut Value) -> Result<()> {
     board["revision"] = json!(board["revision"].as_u64().unwrap() + 1);
-    save(&root().join("kanban.json"), board)
+    // Native tasks remain owned by Codex; only explicit board edits are persisted.
+    let cards: Vec<_> = board["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|card| card["discovered"] != true)
+        .cloned()
+        .collect();
+    save(
+        &root().join("kanban.json"),
+        &json!({"revision":board["revision"],"cards":cards,
+            "order":board["cards"].as_array().unwrap().iter().map(|c| c["id"].clone()).collect::<Vec<_>>()}),
+    )
 }
 fn index(board: &Value, card: &str) -> Result<usize> {
     board["cards"]
@@ -83,10 +95,113 @@ fn terminal(receipt: &Value) -> bool {
     )
 }
 impl Kanban {
+    async fn local_tasks(&self, service: &Arc<service::Service>) -> Result<Vec<Value>> {
+        let mut cache = self.1.lock().await;
+        if let Some((at, tasks)) = cache.as_ref() {
+            if at.elapsed() < Duration::from_secs(5) {
+                return Ok(tasks.clone());
+            }
+        }
+        let mut tasks = Vec::new();
+        let mut args = json!({"agent":"codex","limit":200});
+        let mut cursors = std::collections::HashSet::new();
+        loop {
+            let page = service
+                .agents
+                .tool(&service.control, "agent_tasks", args.clone())
+                .await?;
+            tasks.extend(
+                page["tasks"]
+                    .as_array()
+                    .ok_or("INVALID_TASK_LIST")?
+                    .iter()
+                    .cloned(),
+            );
+            let Some(cursor) = page["nextCursor"].as_str().filter(|s| !s.is_empty()) else {
+                break;
+            };
+            if !cursors.insert(cursor.to_owned()) {
+                return Err("INVALID_TASK_CURSOR".into());
+            }
+            args["cursor"] = json!(cursor);
+        }
+        *cache = Some((std::time::Instant::now(), tasks.clone()));
+        Ok(tasks)
+    }
+    async fn board(&self, service: &Arc<service::Service>) -> Result<Value> {
+        let mut board = read()?;
+        let tasks = match self.local_tasks(service).await {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                board["discoveryError"] = json!(error);
+                self.1
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|(_, tasks)| tasks.clone())
+                    .unwrap_or_default()
+            }
+        };
+        let order: std::collections::HashMap<String, usize> = board["order"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(i, id)| id.as_str().map(|id| (id.to_owned(), i)))
+            .collect();
+        let cards = board["cards"].as_array_mut().unwrap();
+        let mut known: std::collections::HashSet<String> = cards
+            .iter()
+            .filter_map(|c| {
+                (c["link"]["agent"] == "codex").then(|| string(&c["link"], "taskId").to_owned())
+            })
+            .collect();
+        known.extend(cards.iter().map(|c| string(c, "id").to_owned()));
+        for task in tasks {
+            let id = string(&task, "taskId");
+            if task["archived"] == true
+                || uuid::Uuid::parse_str(id).is_err()
+                || !known.insert(id.to_owned())
+            {
+                continue;
+            }
+            let title = [string(&task, "title"), string(&task, "preview"), id]
+                .into_iter()
+                .find(|s| !s.trim().is_empty())
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap_or(id)
+                .chars()
+                .take(240)
+                .collect::<String>();
+            let waiting = task["activeFlags"].as_array().is_some_and(|flags| {
+                flags.iter().any(|f| {
+                    let f = f.as_str().unwrap_or("").to_lowercase();
+                    f.contains("waiting") || f.contains("approval") || f.contains("input")
+                })
+            });
+            let stage = if waiting {
+                "review"
+            } else if task["runtimeStatus"] == "active" {
+                "doing"
+            } else {
+                "todo"
+            };
+            cards.push(
+                json!({"id":id,"title":title,"description":"","project":string(&task,"cwd"),
+                "labels":"","due":"","stage":stage,"checklist":[],"archived":false,
+                "discovered":true,"link":{"agent":"codex","taskId":id}}),
+            );
+        }
+        cards.sort_by_key(|card| order.get(string(card, "id")).copied().unwrap_or(usize::MAX));
+        Ok(board)
+    }
+
     pub async fn query(&self, service: &Arc<service::Service>, args: &Value) -> Result<Value> {
         let mut board = {
             let _guard = self.0.lock().await;
-            read()?
+            self.board(service).await?
         };
         let card_id = string(args, "cardId");
         if card_id.is_empty() {
@@ -100,7 +215,7 @@ impl Kanban {
                     let task = receipt["taskId"].as_str().filter(|s| !s.is_empty());
                     if let Some(task) = task {
                         let _guard = self.0.lock().await;
-                        board = read()?;
+                        board = self.board(service).await?;
                         let i = index(&board, card_id)?;
                         let link = json!({"agent":run["arguments"]["agent"],"taskId":task});
                         if board["cards"][i]["run"] == run && board["cards"][i]["link"] != link {
@@ -132,11 +247,18 @@ impl Kanban {
     }
     pub async fn update(&self, service: &Arc<service::Service>, args: &Value) -> Result<Value> {
         let _guard = self.0.lock().await;
-        let mut board = read()?;
+        let mut board = self.board(service).await?;
         if args["revision"] != board["revision"] {
             return Err("KANBAN_CHANGED".into());
         }
         let card_id = string(args, "id");
+        if string(args, "action") != "create" {
+            let i = index(&board, card_id)?;
+            board["cards"][i]
+                .as_object_mut()
+                .unwrap()
+                .remove("discovered");
+        }
         uuid::Uuid::parse_str(card_id).map_err(|_| "INVALID_KANBAN_ID")?;
         match string(args, "action") {
             "create" => {
@@ -222,8 +344,12 @@ impl Kanban {
         let card_id = string(args, "id");
         let run = {
             let _guard = self.0.lock().await;
-            let mut board = read()?;
+            let mut board = self.board(service).await?;
             let i = index(&board, card_id)?;
+            board["cards"][i]
+                .as_object_mut()
+                .unwrap()
+                .remove("discovered");
             let previous = board["cards"][i]["run"].clone();
             if previous["arguments"]["requestId"] == args["requestId"] && previous.is_object() {
                 previous

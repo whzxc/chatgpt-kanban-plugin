@@ -1,5 +1,5 @@
 .kanban-app {
-  height: 100dvh;
+  height: var(--mcp-panel-height, 100dvh);
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -75,10 +75,8 @@
   align-items: stretch;
 }
 .kanban-column {
-  width: 292px;
   min-width: 260px;
   flex: 1 0 260px;
-  max-width: 350px;
   border: 1px solid transparent;
   border-radius: 12px;
   background: var(--surface-subtle);

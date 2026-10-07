@@ -2,7 +2,7 @@
 const panel=document.getElementById('panel') as HTMLIFrameElement;
 const theme=matchMedia('(prefers-color-scheme: dark)');
 const send=(message:unknown)=>panel.contentWindow?.postMessage(message,location.origin);
-function context(){const p=new URLSearchParams(location.search);return {theme:p.get('theme')|| (theme.matches?'dark':'light'),locale:p.get('locale')||navigator.language};}
+function context(){const p=new URLSearchParams(location.search);return {containerDimensions:{width:panel.clientWidth,height:panel.clientHeight},theme:p.get('theme')|| (theme.matches?'dark':'light'),locale:p.get('locale')||navigator.language};}
 window.addEventListener('message',async event=>{
  if(event.source!==panel.contentWindow||event.origin!==location.origin||event.data?.jsonrpc!=='2.0')return;
  const {id,method,params}=event.data;if(id===undefined)return;
@@ -19,3 +19,5 @@ window.addEventListener('message',async event=>{
 });
 theme.addEventListener('change',()=>send({jsonrpc:'2.0',method:'ui/notifications/host-context-changed',params:context()}));
 panel.src='/plugin-panel.html';
+
+new ResizeObserver(() => send({ jsonrpc: "2.0", method: "ui/notifications/host-context-changed", params: context() })).observe(panel);

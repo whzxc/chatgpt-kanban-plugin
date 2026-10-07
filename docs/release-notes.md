@@ -1,1 +1,4 @@
-独立的 ChatGPT Desktop Kanban 插件，包含卡片管理、任务关联与显式 Agent 执行。支持 Apple Silicon macOS 和 Windows x64，同仓库维护源码、原生插件包及市场目录。
+- 修复 Kanban 面板随宿主窗口尺寸变化的布局，宽窗口下看板列填满可用空间。
+- 名称固定为 Kanban，图标统一为 square-kanban。
+- 自动发现本机未归档 Codex 任务，支持任务详情、搜索与项目筛选；保留手动阶段、排序与归档状态。
+- CI/CD 收敛为手动构建与可选发布；推送、PR 和标签创建不再自动触发。

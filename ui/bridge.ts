@@ -1,8 +1,11 @@
+import { applyHostSize, observeHostSize } from "./host-size";
+let stopSizing: (() => void) | undefined;
 import { locale, resolveLocale } from "./i18n";
 import { applyMcpHostTheme } from "./theme";
 declare const __PLUGIN_VERSION__: string;
 function hostContext(context: unknown) {
  applyMcpHostTheme(context);
+ applyHostSize(context);
  const host=context as {locale?:string}|undefined;
  if(host?.locale){const next=resolveLocale([host.locale]);locale.set(next);document.documentElement.lang=next;}
 }
@@ -19,13 +22,14 @@ window.addEventListener("message",event=>{
  if(call&&!message.method){pending.delete(message.id);clearTimeout(call.timeout);if(message.error)call.reject(new Error(message.error.message));else call.resolve(message.result);return;}
  if(message.method==="ui/notifications/host-context-changed")hostContext(message.params);
  if(message.method==="ui/resource-teardown"){
+  stopSizing?.();
   for(const call of pending.values()){clearTimeout(call.timeout);call.reject(new Error("Panel closed"));}pending.clear();
   window.parent.postMessage({jsonrpc:"2.0",id:message.id,result:{}},"*");
  }
 });
 let initialization:Promise<void>|undefined;
 export function initialize(){return initialization??=(rpc("ui/initialize",{appInfo:{name:"chatgpt-kanban",version:__PLUGIN_VERSION__},appCapabilities:{},protocolVersion:"2026-01-26"}).then(result=>{
- hostContext(result.hostContext);window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/initialized"},"*");
+ hostContext(result.hostContext);stopSizing?.();stopSizing=observeHostSize();window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/initialized"},"*");
 },error=>{initialization=undefined;throw error;}));}
 export async function callTool<T>(name:string,args:Record<string,unknown>):Promise<T>{
  const response=await rpc("tools/call",{name,arguments:args});const result=response.structuredContent?.result as T&{error?:{message?:string}};

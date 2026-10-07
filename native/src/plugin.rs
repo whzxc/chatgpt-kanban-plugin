@@ -15,7 +15,7 @@ fn uri() -> String {
     )
 }
 fn kanban_tools() -> Vec<Value> {
-    [("kanban", "看板", true), ("kanban_update", "更新看板", false), ("kanban_execute", "执行任务", false)].into_iter().map(|(name,title,read)| {
+    [("kanban", "Kanban", true), ("kanban_update", "更新看板", false), ("kanban_execute", "执行任务", false)].into_iter().map(|(name,title,read)| {
         let mut meta = json!({"ui":{"resourceUri":uri(),"visibility":["app"]}});
         if read { meta["openai/ui"] = json!({"entrypoints":[{"type":"global"}]}); }
         let properties = if read { json!({"cardId":{"type":"string"}}) } else if name == "kanban_execute" {
